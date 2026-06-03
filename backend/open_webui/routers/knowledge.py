@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Any, List, Optional
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
 from fastapi.responses import StreamingResponse
@@ -395,6 +395,132 @@ class KnowledgeFilesResponse(KnowledgeResponse):
     write_access: Optional[bool] = False
 
 
+class KnowledgeChunkKnowledge(BaseModel):
+    id: str
+    name: str
+    description: Optional[str] = None
+
+
+class KnowledgeChunkItem(BaseModel):
+    chunk_id: str
+    ordinal: int
+    text: str
+    truncated: bool = False
+    metadata: Any = None
+    file_id: Optional[str] = None
+    source: Optional[str] = None
+
+
+class KnowledgeChunksResponse(BaseModel):
+    knowledge_base: KnowledgeChunkKnowledge
+    page: int
+    page_size: int
+    total: int
+    has_next: bool
+    chunks: list[KnowledgeChunkItem]
+
+
+def _first_result_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list) and value and isinstance(value[0], list):
+        return value[0]
+    if isinstance(value, list):
+        return value
+    return []
+
+
+def _vector_result_get(result: Any, key: str) -> Any:
+    if result is None:
+        return None
+    if isinstance(result, dict):
+        return result.get(key)
+    return getattr(result, key, None)
+
+
+def _chunk_metadata_value(metadata: Any, keys: list[str]) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+
+    for key in keys:
+        value = metadata.get(key)
+        if value is not None:
+            return str(value)
+
+    nested = metadata.get("file")
+    if isinstance(nested, dict):
+        for key in keys:
+            value = nested.get(key)
+            if value is not None:
+                return str(value)
+
+    return None
+
+
+def _normalize_knowledge_chunks(
+    result: Any,
+    *,
+    file_id: str | None = None,
+    q: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    max_text_chars: int = 10000,
+) -> tuple[list[KnowledgeChunkItem], int, bool]:
+    ids = _first_result_list(_vector_result_get(result, "ids"))
+    documents = _first_result_list(_vector_result_get(result, "documents"))
+    metadatas = _first_result_list(_vector_result_get(result, "metadatas"))
+
+    page = max(page, 1)
+    page_size = min(max(page_size, 1), 200)
+    max_text_chars = min(max(max_text_chars, 0), 50000)
+    query = q.casefold() if q else None
+
+    filtered: list[KnowledgeChunkItem] = []
+    total_rows = max(len(ids), len(documents), len(metadatas))
+    for idx in range(total_rows):
+        chunk_id = str(ids[idx]) if idx < len(ids) and ids[idx] is not None else str(idx)
+        raw_text = documents[idx] if idx < len(documents) else ""
+        text = raw_text if isinstance(raw_text, str) else str(raw_text or "")
+        metadata = metadatas[idx] if idx < len(metadatas) else {}
+        if not isinstance(metadata, dict):
+            metadata = metadata if metadata is not None else {}
+
+        normalized_file_id = _chunk_metadata_value(
+            metadata,
+            ["file_id", "fileId", "file_uuid", "file", "document_id", "documentId"],
+        )
+        source = _chunk_metadata_value(
+            metadata,
+            ["source", "filename", "file_name", "name", "path"],
+        )
+
+        if file_id and normalized_file_id != file_id:
+            continue
+        if query and query not in text.casefold():
+            continue
+
+        truncated = len(text) > max_text_chars
+        if truncated:
+            text = text[:max_text_chars]
+
+        filtered.append(
+            KnowledgeChunkItem(
+                chunk_id=chunk_id,
+                ordinal=idx + 1,
+                text=text,
+                truncated=truncated,
+                metadata=metadata,
+                file_id=normalized_file_id,
+                source=source,
+            )
+        )
+
+    total = len(filtered)
+    skip = (page - 1) * page_size
+    paged = filtered[skip : skip + page_size]
+    return paged, total, skip + page_size < total
+
+
 @router.get("/{id}", response_model=Optional[KnowledgeFilesResponse])
 async def get_knowledge_by_id(
     id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
@@ -619,6 +745,66 @@ async def get_knowledge_files_by_id(
 
     return Knowledges.search_files_by_id(
         id, user.id, filter=filter, skip=skip, limit=limit, db=db
+    )
+
+
+@router.get("/{id}/chunks", response_model=KnowledgeChunksResponse)
+async def get_knowledge_chunks_by_id(
+    id: str,
+    file_id: Optional[str] = None,
+    q: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    max_text_chars: int = Query(10000, ge=0, le=50000),
+    user=Depends(get_admin_user),
+    db: Session = Depends(get_session),
+):
+    knowledge = Knowledges.get_knowledge_by_id(id=id, db=db)
+    if not knowledge:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    has_collection = await run_in_threadpool(
+        VECTOR_DB_CLIENT.has_collection,
+        collection_name=id,
+    )
+    if not has_collection:
+        return KnowledgeChunksResponse(
+            knowledge_base=KnowledgeChunkKnowledge(
+                id=knowledge.id,
+                name=knowledge.name,
+                description=knowledge.description,
+            ),
+            page=page,
+            page_size=page_size,
+            total=0,
+            has_next=False,
+            chunks=[],
+        )
+
+    result = await run_in_threadpool(VECTOR_DB_CLIENT.get, collection_name=id)
+    chunks, total, has_next = _normalize_knowledge_chunks(
+        result,
+        file_id=file_id,
+        q=q,
+        page=page,
+        page_size=page_size,
+        max_text_chars=max_text_chars,
+    )
+
+    return KnowledgeChunksResponse(
+        knowledge_base=KnowledgeChunkKnowledge(
+            id=knowledge.id,
+            name=knowledge.name,
+            description=knowledge.description,
+        ),
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_next=has_next,
+        chunks=chunks,
     )
 
 
